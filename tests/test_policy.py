@@ -26,6 +26,7 @@ from app.policy import (
     parse_network,
     parse_strict_cidr,
     reverse_delegations,
+    roa_coverage,
     TRANSITION_KEYS,
 )
 
@@ -1904,3 +1905,328 @@ def test_reverse_sibling_delegations_partition_the_parent_without_gaps():
     assert owners == list(range(256))
     assert all(r["cidr"] == "10.0.0.0/25" for r in cnames[:128])
     assert all(r["cidr"] == "10.0.0.128/25" for r in cnames[128:])
+
+
+# ---------------------------------------------------------------------------
+# roa-coverage: ROA valid/invalid/unknown partition, with a brute-force
+# per-candidate reference implementation and random IPv4/IPv6 cross-checks.
+# ---------------------------------------------------------------------------
+
+
+def _ref_roa_status(candidate, asn, roas):
+    """Brute-force RFC 6483 status for one aligned candidate route."""
+    covered = False
+    for network, roa_asn, max_length in roas:
+        if candidate.subnet_of(network):
+            covered = True
+            if roa_asn == asn and candidate.prefixlen <= max_length:
+                return "valid"
+    return "invalid" if covered else "unknown"
+
+
+def _assert_roa_partition_matches_reference(scope_s, asn, length, roas_raw):
+    """Validate tiling, statuses, minimality and ordering against brute force."""
+    scope = ipaddress.ip_network(scope_s, strict=True)
+    roas = [
+        (ipaddress.ip_network(c, strict=True), a, m) for c, a, m in roas_raw
+    ]
+    result = roa_coverage(scope_s, asn, length, roas_raw)["partitions"]
+    parts = [
+        (ipaddress.ip_network(p["cidr"], strict=True), p["status"])
+        for p in result
+    ]
+
+    if length < scope.prefixlen:
+        assert parts == []
+        return
+
+    candidates = list(scope.subnets(new_prefix=length))
+    expected = {c: _ref_roa_status(c, asn, roas) for c in candidates}
+
+    # Sorted by network address.
+    assert [int(n.network_address) for n, _ in parts] == sorted(
+        int(n.network_address) for n, _ in parts
+    )
+    # Pieces are inside scope, no longer than the requested length, pairwise
+    # disjoint and jointly exhaust the whole scope candidate region.
+    for network, _status in parts:
+        assert network.subnet_of(scope)
+        assert scope.prefixlen <= network.prefixlen <= length
+        for other, _ in parts:
+            assert not (network != other and network.overlaps(other))
+    assert sum(1 << (length - n.prefixlen) for n, _ in parts) == len(candidates)
+    # Every candidate inside a piece shares the piece's status.
+    for network, status in parts:
+        inside = [c for c in candidates if c.subnet_of(network)]
+        assert inside  # a piece always covers at least one aligned candidate
+        assert all(expected[c] == status for c in inside)
+    # Minimum: no two equal-status siblings are left unmerged.
+    table = {(int(n.network_address), n.prefixlen): s for n, s in parts}
+    for network, status in parts:
+        if network.prefixlen > scope.prefixlen:
+            halves = list(network.supernet().subnets())
+            sibling = halves[1] if halves[0] == network else halves[0]
+            assert table.get((int(sibling.network_address), sibling.prefixlen)) != status
+
+
+def test_roa_valid_invalid_unknown_basic_partition():
+    result = roa_coverage(
+        "203.0.113.0/24", 64500, 26,
+        [
+            ("203.0.113.0/25", 64500, 26),    # authorizes both lower /26s
+            ("203.0.113.128/26", 64501, 26),  # covers with the wrong ASN
+        ],
+    )
+    assert result == {"partitions": [
+        {"cidr": "203.0.113.0/25", "status": "valid"},
+        {"cidr": "203.0.113.128/26", "status": "invalid"},
+        {"cidr": "203.0.113.192/26", "status": "unknown"},
+    ]}
+
+
+def test_roa_max_length_too_short_makes_invalid_and_merges_to_scope():
+    # A covering ROA for the target ASN whose max_length is below the
+    # proposed length leaves both /25 candidates invalid; the equal-status
+    # siblings merge to one piece coarser than the requested length.
+    result = roa_coverage(
+        "203.0.113.0/24", 64500, 25,
+        [("203.0.113.0/24", 64500, 24)],
+    )
+    assert result == {"partitions": [
+        {"cidr": "203.0.113.0/24", "status": "invalid"},
+    ]}
+
+
+def test_roa_wrong_asn_beside_validating_roa():
+    # Covered by a wrong-ASN ROA everywhere, but a narrower target-ASN ROA
+    # promotes one candidate to valid.
+    result = roa_coverage(
+        "10.0.0.0/24", 100, 25,
+        [
+            ("10.0.0.0/24", 200, 32),
+            ("10.0.0.0/25", 100, 25),
+        ],
+    )
+    assert result == {"partitions": [
+        {"cidr": "10.0.0.0/25", "status": "valid"},
+        {"cidr": "10.0.0.128/25", "status": "invalid"},
+    ]}
+
+
+def test_roa_valid_never_degrades_under_stricter_wrong_asn_roa():
+    # A broad authorizing ROA covers the whole scope; a narrow wrong-ASN ROA
+    # must not make the covered region invalid.
+    result = roa_coverage(
+        "10.0.0.0/24", 100, 28,
+        [
+            ("10.0.0.0/24", 100, 32),
+            ("10.0.0.0/26", 200, 32),
+        ],
+    )
+    assert result == {"partitions": [
+        {"cidr": "10.0.0.0/24", "status": "valid"},
+    ]}
+
+
+def test_roa_no_roas_means_entire_scope_unknown():
+    result = roa_coverage("10.0.0.0/24", 65000, 28, [])
+    assert result == {"partitions": [
+        {"cidr": "10.0.0.0/24", "status": "unknown"},
+    ]}
+
+
+def test_roa_roa_stricter_than_candidate_does_not_cover():
+    # The /32 ROA lives entirely inside the single /24 candidate route, so it
+    # does not cover that route; it stays unknown.
+    result = roa_coverage(
+        "10.0.0.0/24", 100, 24, [("10.0.0.1/32", 100, 32)],
+    )
+    assert result == {"partitions": [
+        {"cidr": "10.0.0.0/24", "status": "unknown"},
+    ]}
+
+
+def test_roa_disjoint_roas_are_ignored():
+    result = roa_coverage(
+        "10.0.0.0/24", 100, 26,
+        [
+            ("0.0.0.0/0", 100, 32),          # broader: valid everywhere
+            ("9.255.255.255/32", 100, 32),   # disjoint: ignored
+            ("11.0.0.0/16", 200, 32),        # disjoint: ignored
+        ],
+    )
+    assert result == {"partitions": [
+        {"cidr": "10.0.0.0/24", "status": "valid"},
+    ]}
+    result = roa_coverage(
+        "10.0.0.0/24", 100, 26, [("11.0.0.0/16", 200, 32)],
+    )
+    assert result == {"partitions": [
+        {"cidr": "10.0.0.0/24", "status": "unknown"},
+    ]}
+
+
+def test_roa_prefix_length_shorter_than_scope_returns_empty():
+    # No aligned candidate of length < scope prefix fits inside the scope;
+    # this is treated as an empty candidate region (the API rejects it as a
+    # 422, but the core function returns no partitions).
+    assert roa_coverage(
+        "10.0.0.0/24", 100, 23, [("10.0.0.0/24", 100, 24)]
+    ) == {"partitions": []}
+
+
+def test_roa_host_route_granularity_ipv6():
+    result = roa_coverage(
+        "2001:db8::/120", 100, 128,
+        [
+            ("2001:db8::5/128", 100, 128),
+            ("2001:db8::a/128", 200, 128),
+        ],
+    )
+    partitions = result["partitions"]
+    statuses = {p["cidr"]: p["status"] for p in partitions}
+    assert statuses["2001:db8::5/128"] == "valid"
+    assert statuses["2001:db8::a/128"] == "invalid"
+    # All other addresses collapse to one unknown block covering 253 hosts.
+    unknown = [p for p in partitions if p["status"] == "unknown"]
+    assert sum(
+        1 << (128 - ipaddress.ip_network(p["cidr"]).prefixlen)
+        for p in unknown
+    ) == 254
+
+
+def test_roa_ipv6_zero_scope_at_128_does_not_enumerate_and_tiles_space():
+    # A ::/0 scope with /128 candidates has 2**128 routes; the result must
+    # come back instantly as a small CIDR tiling covering the whole space.
+    result = roa_coverage(
+        "::/0", 100, 128,
+        [
+            ("2001:db8::/32", 100, 128),
+            ("2001:db9::/32", 200, 48),
+        ],
+    )
+    partitions = result["partitions"]
+    assert len(partitions) < 100
+    total = sum(
+        1 << (128 - ipaddress.ip_network(p["cidr"]).prefixlen)
+        for p in partitions
+    )
+    assert total == 1 << 128
+    by_cidr = {p["cidr"]: p["status"] for p in partitions}
+    assert by_cidr["2001:db8::/32"] == "valid"
+    assert by_cidr["2001:db9::/32"] == "invalid"
+
+
+def test_roa_default_scope_route_length_zero():
+    assert roa_coverage(
+        "0.0.0.0/0", 1, 0, [("0.0.0.0/0", 1, 0)]
+    ) == {"partitions": [{"cidr": "0.0.0.0/0", "status": "valid"}]}
+    assert roa_coverage(
+        "0.0.0.0/0", 1, 0, [("0.0.0.0/0", 2, 0)]
+    ) == {"partitions": [{"cidr": "0.0.0.0/0", "status": "invalid"}]}
+    assert roa_coverage("0.0.0.0/0", 1, 0, []) == {
+        "partitions": [{"cidr": "0.0.0.0/0", "status": "unknown"}],
+    }
+
+
+def test_roa_max_length_authorization_boundary():
+    # Exactly-equal max_length authorizes; one less does not.
+    assert roa_coverage(
+        "10.0.0.0/24", 100, 26, [("10.0.0.0/24", 100, 26)]
+    )["partitions"] == [{"cidr": "10.0.0.0/24", "status": "valid"}]
+    assert roa_coverage(
+        "10.0.0.0/24", 100, 26, [("10.0.0.0/24", 100, 25)]
+    )["partitions"] == [{"cidr": "10.0.0.0/24", "status": "invalid"}]
+
+
+def test_roa_cross_family_roa_rejected():
+    with pytest.raises(ValueError, match="address family"):
+        roa_coverage("10.0.0.0/24", 100, 26, [("2001:db8::/32", 100, 48)])
+    with pytest.raises(ValueError, match="address family"):
+        roa_coverage("2001:db8::/32", 100, 48, [("10.0.0.0/8", 100, 24)])
+
+
+def test_roa_invalid_max_length_rejected():
+    # max_length below the ROA prefix length.
+    with pytest.raises(ValueError, match="max_length"):
+        roa_coverage("10.0.0.0/24", 100, 26, [("10.0.0.0/25", 100, 24)])
+    # max_length beyond the family width.
+    with pytest.raises(ValueError, match="max_length"):
+        roa_coverage("10.0.0.0/24", 100, 26, [("10.0.0.0/24", 100, 33)])
+    with pytest.raises(ValueError, match="max_length"):
+        roa_coverage("2001:db8::/32", 100, 48, [("2001:db8::/32", 100, 129)])
+
+
+def test_roa_strict_cidr_required():
+    with pytest.raises(ValueError):
+        roa_coverage("10.0.0.0/24", 100, 26, [("10.0.0.0", 100, 24)])
+    with pytest.raises(ValueError):
+        roa_coverage("10.0.0.0/24", 100, 26, [("10.0.0.1/24", 100, 24)])
+
+
+def test_roa_random_ipv4_cases_match_brute_force():
+    rng = random.Random(20240927)
+    for _ in range(500):
+        scope_len = rng.randint(0, 20)
+        scope = ipaddress.IPv4Network((
+            rng.getrandbits(32) & (((1 << (32 - scope_len)) - 1)
+                                   << (32 - scope_len))
+            if scope_len else 0,
+            scope_len,
+        ))
+        length = rng.randint(scope.prefixlen, min(32, scope.prefixlen + 8))
+        roas = []
+        for _ in range(rng.randint(0, 8)):
+            pl = rng.randint(scope.prefixlen,
+                             min(length + rng.randint(0, 3), 32))
+            base = rng.getrandbits(32) & (
+                ((1 << (32 - pl)) - 1) << (32 - pl)
+            )
+            roas.append((
+                str(ipaddress.IPv4Network((base, pl))),
+                rng.choice([100, 200, 300]),
+                rng.randint(pl, min(32, pl + 3)),
+            ))
+        _assert_roa_partition_matches_reference(
+            str(scope), rng.choice([100, 400]), length, roas,
+        )
+
+
+def test_roa_random_ipv6_cases_match_brute_force():
+    rng = random.Random(20240928)
+    for _ in range(300):
+        scope_len = rng.randint(0, 8)
+        scope = ipaddress.IPv6Network((
+            rng.getrandbits(128) & (((1 << (128 - scope_len)) - 1)
+                                    << (128 - scope_len))
+            if scope_len else 0,
+            scope_len,
+        ))
+        length = rng.randint(scope.prefixlen, min(128, scope.prefixlen + 6))
+        roas = []
+        for _ in range(rng.randint(0, 8)):
+            pl = rng.randint(scope.prefixlen, min(length + 2, 128))
+            base = rng.getrandbits(128) & (
+                ((1 << (128 - pl)) - 1) << (128 - pl)
+            )
+            roas.append((
+                str(ipaddress.IPv6Network((base, pl))),
+                rng.choice([100, 200]),
+                rng.randint(pl, min(128, pl + 2)),
+            ))
+        _assert_roa_partition_matches_reference(
+            str(scope), rng.choice([100, 300]), length, roas,
+        )
+
+
+def test_roa_random_shorter_length_cases_return_empty():
+    rng = random.Random(7)
+    for _ in range(50):
+        scope_len = rng.randint(1, 24)
+        scope = ipaddress.IPv4Network((
+            rng.getrandbits(32) & (((1 << (32 - scope_len)) - 1)
+                                   << (32 - scope_len)),
+            scope_len,
+        ))
+        length = rng.randint(0, scope_len - 1)
+        assert roa_coverage(str(scope), 1, length, []) == {"partitions": []}

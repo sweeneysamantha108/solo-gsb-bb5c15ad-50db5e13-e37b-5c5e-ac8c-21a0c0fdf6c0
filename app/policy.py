@@ -14,10 +14,13 @@ The module also hosts three scope-based consumers of the same primitives:
 scope), plus ``allocate`` (lexicographically smallest non-overlapping subnet
 assignment inside one scope, avoiding occupied CIDRs), ``anonymize``
 (prefix-preserving keyed HMAC anonymization of bare addresses and strict
-CIDRs for safe sharing of address lists) and ``reverse_delegations``
+CIDRs for safe sharing of address lists), ``reverse_delegations``
 (reverse-DNS delegation plans for the IPv4 networks of one /24: direct
 in-addr.arpa NS records for a /24, RFC 2317 range-label subzones plus
-per-address parent-zone CNAMEs for /25 through /32).
+per-address parent-zone CNAMEs for /25 through /32) and ``roa_coverage``
+(RFC 6483 RPKI ROA valid/invalid/unknown coverage map for every aligned
+candidate route of one prefix length inside one scope, returned as a
+minimal non-overlapping CIDR status partition).
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ import hmac
 import ipaddress
 import re
 from collections.abc import Iterable, Sequence
-from typing import TypeAlias, Union
+from typing import NamedTuple, TypeAlias, Union
 
 Network: TypeAlias = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 Address: TypeAlias = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
@@ -1445,3 +1448,229 @@ def reverse_delegations(
                 })
 
     return {"zones": zones, "records": records}
+
+
+# ---------------------------------------------------------------------------
+# roa-coverage: RFC 6483 RPKI ROA coverage map for every candidate route of a
+# fixed prefix length inside one scope.  Each candidate is:
+#   valid   - some covering ROA with the origin ASN and max_length >= length;
+#   invalid - covered by at least one ROA, but none authorizes (target ASN
+#             with a big-enough max_length) — wrong-ASN and length-exceeded
+#             ROAs both make the route invalid (RFC 6483);
+#   unknown - no ROA prefix covers the route at all.
+# The scope is partitioned into maximal status-constant CIDRs by a prefix-tree
+# walk driven only by ROA boundaries (never enumerating the aligned /L
+# candidates, so a /128-granular IPv6 scope stays cheap), then equal-status
+# sibling halves are merged bottom-up into the minimum CIDR set.
+# ---------------------------------------------------------------------------
+
+#: ROA validation states (a valid ROA wins over any invalid one on the same
+#: route; unknown means no ROA covers the route).
+ROA_STATES: tuple[str, ...] = ("valid", "invalid", "unknown")
+
+
+class Roa(NamedTuple):
+    """One Route Origin Authorization: prefix, origin ASN, max_length."""
+
+    network: Network
+    asn: int
+    max_length: int
+
+
+def _roa_partition_node(
+    network: Network,
+    active: Sequence[Roa],
+    pending: Sequence[Roa],
+    target_asn: int,
+    length: int,
+    out: list[tuple[Network, str]],
+) -> None:
+    """Append status-constant pieces covering every aligned ``/length`` route.
+
+    ``active`` ROAs have a prefix equal to or broader than ``network`` (they
+    cover every candidate in it); ``pending`` ROAs are strict subnets whose
+    prefix reaches no deeper than ``/length`` (an ROA stricter than the
+    candidate granularity lives inside one candidate and never covers it, so
+    such ROAs are dropped before the walk).
+
+    A node terminates as soon as the pending ROAs cannot change its status:
+
+    * an authorizing active ROA already covers it — ``valid`` never degrades;
+    * at the ``/length`` boundary every aligned candidate shares the active
+      set and no pending ROA covers the whole candidate;
+    * ``invalid`` (covered, not authorized) with no validating pending ROA —
+      wrong-ASN/length-too-short ROAs only keep it invalid;
+    * ``unknown`` with no pending ROA at all — nothing can cover it.
+
+    Otherwise the node splits into its two sibling halves, forwarding each
+    ROA to the half it reaches, exactly like :func:`_partition_node`.  The
+    walk therefore touches only ROA boundaries instead of every candidate
+    (an uncut ``::/0`` region costs O(1), not :math:`2^{128}` nodes).
+    """
+    authorizing = any(
+        roa.asn == target_asn and roa.max_length >= length for roa in active
+    )
+    if authorizing:
+        out.append((network, "valid"))
+        return
+
+    if network.prefixlen == length:
+        out.append((network, "invalid" if active else "unknown"))
+        return
+
+    if active:
+        # Covered but not authorized: only a ROA carrying the target ASN with
+        # sufficient max_length can promote any region to valid.
+        if not any(
+            roa.asn == target_asn and roa.max_length >= length
+            for roa in pending
+        ):
+            out.append((network, "invalid"))
+            return
+    elif not pending:
+        out.append((network, "unknown"))
+        return
+
+    left, right = network.subnets()
+    for half in (left, right):
+        half_active = list(active)
+        half_pending: list[Roa] = []
+        for roa in pending:
+            # Pending prefixes are strict subnets of network: each one equals
+            # exactly one half (and starts covering there) or is a strict
+            # subnet of exactly one half.
+            if roa.network == half:
+                half_active.append(roa)
+            elif roa.network.subnet_of(half):
+                half_pending.append(roa)
+        _roa_partition_node(
+            half, half_active, half_pending, target_asn, length, out
+        )
+
+
+def _merge_status_pieces(
+    blocks: Sequence[tuple[Network, str]],
+    scope: Network,
+) -> list[tuple[Network, str]]:
+    """Recursively merge complete sibling pairs carrying the same ROA status.
+
+    Same bottom-up fixpoint as :func:`ipaddress.collapse_addresses` (used by
+    :func:`_merge_labelled`): two pieces merge only when both halves of one
+    common parent are present, carry the identical status and the parent
+    stays inside ``scope`` (or equals it).  A pair whose parent would be
+    broader than the scope is never joined — the pieces tile exactly the
+    scope, which is therefore the coarsest legal output; that boundary test
+    on the parent (not the pieces) also covers a ``/0`` scope.
+    """
+    pieces = list(blocks)
+    while True:
+        # One pass pairs disjoint sibling sets: pieces that can still merge
+        # are grouped by the parent they would merge into; a two-piece,
+        # same-status group whose parent stays inside the scope becomes that
+        # parent, while every other piece (and every piece already at/above
+        # the scope boundary) carries over unchanged.  Repeat so parents born
+        # in this pass can merge again (fixpoint), just like
+        # ipaddress.collapse_addresses.
+        groups: dict[tuple[bytes, int], list[tuple[Network, str]]] = {}
+        carried: list[tuple[Network, str]] = []
+        for network, status in pieces:
+            if network.prefixlen <= scope.prefixlen:
+                # The scope itself is the coarsest legal output; skipping its
+                # piece by length (rather than by parent containment) also
+                # stops a /0 scope's halves-merged-to-root from looping.
+                carried.append((network, status))
+                continue
+            parent = network.supernet()
+            groups.setdefault(_sort_key(parent), []).append((network, status))
+
+        merged: list[tuple[Network, str]] = []
+        any_merge = False
+        for group in groups.values():
+            if len(group) == 2 and group[0][1] == group[1][1]:
+                merged.append((group[0][0].supernet(), group[0][1]))
+                any_merge = True
+            else:
+                merged.extend(group)
+
+        if not any_merge:
+            pieces.sort(key=lambda block: _sort_key(block[0]))
+            return pieces
+        pieces = carried + merged
+
+
+def roa_coverage(
+    scope_raw: str,
+    target_asn: int,
+    prefix_length: int,
+    roas: Sequence[tuple[str, int, int]],
+) -> dict:
+    """Partition ``scope`` into the ROA status of every aligned candidate route.
+
+    A candidate route is each aligned network of prefix ``prefix_length``
+    fully contained in the strict scope.  Per RFC 6483 a route is ``valid``
+    when some covering ROA lists ``target_asn`` with ``max_length`` at least
+    ``prefix_length``; otherwise ``invalid`` when at least one ROA covers it
+    (wrong origin ASN, or every covering ROA's ``max_length`` is too small);
+    and ``unknown`` when no ROA covers it.
+
+    The output is the minimum tiling of the candidate region: sorted,
+    non-overlapping, jointly-exhaustive CIDRs whose prefix length is at most
+    ``prefix_length`` (pieces may be shorter where every candidate in a larger
+    aligned block shares one status), each paired with its constant status.
+    Nothing is enumerated candidate-by-candidate — the prefix-tree walk is
+    driven only by ROA prefix boundaries, so even a ``::/0`` scope at
+    ``/128`` costs at most :math:`O(|ROAs| \\cdot \\text{width})` nodes.
+
+    Caller validation (e.g. the Pydantic schema) guarantees the scope parses
+    strictly, ``prefix_length`` fits the scope family and is not shorter than
+    the scope prefix, every ROA CIDR parses strictly in the same family, and
+    each ``max_length`` lies between its ROA prefix length and the family
+    width; ``target_asn`` is a 32-bit AS number.  A malformed value raises
+    :class:`ValueError`.
+    """
+    scope = parse_network(scope_raw)
+    family = type(scope)
+    length = prefix_length
+    max_bits = _MAX_PREFIXLEN[family]
+
+    parsed: list[Roa] = []
+    for cidr, asn, max_length in roas:
+        network = parse_strict_cidr(cidr)
+        if not isinstance(network, family):
+            raise ValueError(
+                f"ROA CIDR {network} does not match the scope address "
+                f"family ({scope})"
+            )
+        if max_length < network.prefixlen or max_length > max_bits:
+            raise ValueError(
+                f"ROA for {network} has max_length /{max_length}; it must "
+                f"lie between /{network.prefixlen} and /{max_bits}"
+            )
+        if network.overlaps(scope):
+            parsed.append(Roa(network, asn, max_length))
+
+    pieces: list[tuple[Network, str]] = []
+    if length >= scope.prefixlen:
+        # ROAs equal to or broader than the scope cover its root; ROAs
+        # strictly inside the scope can change the status below it.  An ROA
+        # stricter than the candidate granularity lives entirely inside one
+        # candidate route and covers none of them, so it never participates.
+        root_active = [
+            roa for roa in parsed if roa.network.prefixlen <= scope.prefixlen
+        ]
+        root_pending = [
+            roa for roa in parsed
+            if scope.prefixlen < roa.network.prefixlen <= length
+        ]
+        _roa_partition_node(
+            scope, root_active, root_pending, target_asn, length, pieces
+        )
+        pieces = _merge_status_pieces(pieces, scope)
+        pieces.sort(key=lambda block: _sort_key(block[0]))
+
+    return {
+        "partitions": [
+            {"cidr": str(network), "status": status}
+            for network, status in pieces
+        ],
+    }

@@ -626,3 +626,138 @@ class ReverseDelegationsResponse(BaseModel):
             "RFC 2317 delegations."
         ),
     )
+
+
+class RoaEntry(BaseModel):
+    cidr: str = Field(
+        description=(
+            "Strict ROA prefix (explicit prefix length required, host bits "
+            "must be zero); its address family must match the scope."
+        ),
+    )
+    asn: int = Field(
+        ge=0,
+        le=4294967295,
+        description=(
+            "Authorized origin AS number (32-bit unsigned ASN, 0 through "
+            "4294967295)."
+        ),
+    )
+    max_length: int = Field(
+        ge=0,
+        description=(
+            "Longest prefix length the ROA authorizes for its prefix; must "
+            "be at least the ROA prefix length and at most 32 (IPv4) or 128 "
+            "(IPv6)."
+        ),
+    )
+
+    @field_validator("cidr")
+    @classmethod
+    def _validate_cidr(cls, value: str) -> str:
+        # Strict notation only: a bare address without '/p' is rejected.
+        parse_strict_cidr(value)
+        return value
+
+    @model_validator(mode="after")
+    def _validate_max_length(self) -> "RoaEntry":
+        network = parse_strict_cidr(self.cidr)
+        max_bits = _MAX_PREFIXLEN[type(network)]
+        if self.max_length < network.prefixlen or self.max_length > max_bits:
+            raise ValueError(
+                f"ROA for {network} has max_length /{self.max_length}; it "
+                f"must lie between /{network.prefixlen} and /{max_bits}"
+            )
+        return self
+
+
+class RoaCoverageRequest(BaseModel):
+    scope: str = Field(
+        description=(
+            "Single strict CIDR (IPv4 or IPv6) limiting the analysis region. "
+            "Only aligned candidate routes fully inside it are partitioned."
+        ),
+    )
+    asn: int = Field(
+        ge=0,
+        le=4294967295,
+        description=(
+            "Target origin AS number of the route to be published (32-bit "
+            "unsigned ASN, 0 through 4294967295)."
+        ),
+    )
+    prefix_length: int = Field(
+        ge=0,
+        description=(
+            "Prefix length of the route to be published; candidate routes "
+            "are every aligned CIDR of this length inside scope. Must be at "
+            "least the scope prefix length and at most 32 (IPv4) or 128 "
+            "(IPv6)."
+        ),
+    )
+    roas: list[RoaEntry] = Field(
+        default_factory=list,
+        description=(
+            "ROA list; every entry must share the scope address family. "
+            "Entries disjoint from the scope do not affect the result."
+        ),
+    )
+
+    @field_validator("scope")
+    @classmethod
+    def _validate_scope(cls, value: str) -> str:
+        parse_network(value)
+        return value
+
+    @model_validator(mode="after")
+    def _validate_against_scope(self) -> "RoaCoverageRequest":
+        # Cross-entry checks live in the whole-model validator; a ValueError
+        # becomes an HTTP 422 just like the per-field validators.
+        scope = parse_network(self.scope)
+        max_bits = _MAX_PREFIXLEN[type(scope)]
+        if self.prefix_length > max_bits:
+            raise ValueError(
+                f"prefix_length {self.prefix_length} exceeds /{max_bits} "
+                f"for the scope address family"
+            )
+        if self.prefix_length < scope.prefixlen:
+            raise ValueError(
+                f"prefix_length /{self.prefix_length} is shorter than the "
+                f"scope prefix /{scope.prefixlen}; no aligned candidate "
+                f"route fits inside {scope}"
+            )
+        for entry in self.roas:
+            network = parse_strict_cidr(entry.cidr)
+            if not isinstance(network, type(scope)):
+                raise ValueError(
+                    f"ROA CIDR {network} does not match the scope address "
+                    f"family ({scope})"
+                )
+        return self
+
+
+class RoaStatusPartition(BaseModel):
+    cidr: str = Field(
+        description=(
+            "Non-overlapping status-constant region; its prefix length may "
+            "be shorter than the requested prefix_length when every aligned "
+            "candidate route inside it shares one status."
+        ),
+    )
+    status: Literal["valid", "invalid", "unknown"] = Field(
+        description=(
+            "'valid' when a same-ASN ROA with sufficient max_length covers "
+            "every candidate in cidr; 'invalid' when ROAs cover them but "
+            "none authorizes; 'unknown' when no ROA covers them."
+        ),
+    )
+
+
+class RoaCoverageResponse(BaseModel):
+    partitions: list[RoaStatusPartition] = Field(
+        description=(
+            "Minimum, non-overlapping, jointly-exhaustive CIDR tiling of the "
+            "candidate region, sorted by network address; the pieces tile "
+            "the whole scope."
+        ),
+    )
