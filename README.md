@@ -6,8 +6,10 @@
 **allow − deny**，返回与原策略**等价、互不重叠且数量最少**的 CIDR 集合。
 另提供地址判定（`/evaluate`）、策略对比（`/compare`）、规则影响审计
 （`/audit-rules`）、策略最小化（`/minimize-policy`）、子网分配
-（`/allocate`）、地址/网段密钥脱敏（`/anonymize`）以及同一 `/24` 内
-IPv4 网段的反向 DNS 委派计划（`/reverse-delegations`）接口。
+（`/allocate`）、地址/网段密钥脱敏（`/anonymize`）、同一 `/24` 内
+IPv4 网段的反向 DNS 委派计划（`/reverse-delegations`），以及在单个
+scope 内对拟发布前缀的所有候选路由做 RPKI ROA 覆盖状态分区
+（`/roa-coverage`）接口。
 
 - deny 前缀切穿 allow 网段时，按二叉前缀树**递归对半拆分**直到边界对齐；
 - 仅当两个网段构成**完整相邻的兄弟前缀**（同一父网的左右两半）时才合并，
@@ -27,6 +29,12 @@ IPv4 网段的反向 DNS 委派计划（`/reverse-delegations`）接口。
   `in-addr.arpa` 区域（NS），`/25`～`/32` 按 **RFC 2317** 以
   「`<网络地址末段>/<前缀>`」范围标签委派子区（NS），并由父区为覆盖的
   每个地址发布指向子区内 PTR 名称的 CNAME；网段相交或跨 `/24` 整批拒绝；
+- `/roa-coverage` 对单个 scope 内**某一拟发布前缀长度**的全部候选路由，
+  按 ROA 前缀包含关系给出 **valid / invalid / unknown** 状态分区：任一同
+  ASN 且 `max_length` 足够的覆盖 ROA 即 `valid`；有覆盖 ROA 却无授权为
+  `invalid`；完全无覆盖为 `unknown`。输出为按网络地址排序、互不重叠的
+  **最小 CIDR 分区**（分区可短于拟发布长度），基于前缀树递归切分，
+  **不逐个枚举大范围 IPv6 子网**；
 - 非法 CIDR（格式错误、越界前缀、主机位非零）统一返回 **HTTP 422**。
 
 ## 一条命令启动
@@ -718,6 +726,109 @@ curl -i -X POST http://localhost:8000/reverse-delegations \
 （裸地址）、主机位非零、NS 域名非法（含裸 IP 地址）或 NS 列表为空，
 统一返回 **HTTP 422**。空批次（`{}`）合法，返回两个空数组。
 
+### `POST /roa-coverage`
+
+在**单个 `scope` CIDR** 内，针对**某一拟发布前缀长度** `prefix_length` 的
+全部候选路由（scope 内所有对齐的 `/prefix_length` 网段），结合一组
+**RPKI ROA**（Route Origin Authorization）判定其源 AS 起源验证（ROV）状态：
+
+- **`valid`**：至少存在一条 ROA，其前缀**包含**该候选路由，且
+  ROA 的 `asn` 等于目标 ASN、`max_length` **不小于**拟发布长度（该候选
+  得到明确授权）；
+- **`invalid`**：存在 ROA 前缀**包含**该候选路由，但没有任何包含它的 ROA
+  授权目标 ASN（包含 ROA 的 ASN 全部不同，或其 `max_length` 全部短于
+  拟发布长度）；
+- **`unknown`**：没有任何 ROA 前缀包含该候选路由。
+
+> “覆盖/包含”只看前缀包含关系（候选前缀等于或长于 ROA 前缀）；
+> `max_length` 只决定该 ROA **能否授权**，不影响它是否覆盖。比
+> `prefix_length` 更长的 ROA 前缀不可能包含任何候选路由，因此被自然忽略。
+> 只要有一条授权 ROA 与若干未授权 ROA 同时覆盖，候选仍为 `valid`
+> （任一授权即 valid）。
+
+输出不是逐条候选路由，而是把 scope 切成**状态恒定、互不重叠、联合穷尽
+scope 的最小 CIDR 分区**：分区可**短于**拟发布长度（表示其中所有候选
+路由状态相同），但不会长于它。切分只沿 ROA 边界递归进行，**不枚举候选
+路由**，因此即便 scope 为 `::/0`、`prefix_length` 为 128 也瞬间返回。
+
+请求体：
+
+| 字段                | 类型       | 说明                                   |
+| ------------------- | ---------- | -------------------------------------- |
+| `scope`             | `string`   | **必填**，单个 CIDR（IPv4 或 IPv6），限定分析区域；主机位非零返回 422 |
+| `asn`               | `int`      | **必填**，拟发布路由的目标源 ASN，32 位无符号整数（0–4294967295，含 AS0） |
+| `prefix_length`     | `int`      | **必填**，拟发布前缀长度；须满足 **scope 前缀长度 ≤ prefix_length ≤ 族最大值**（IPv4 为 32、IPv6 为 128），短于 scope 或越界返回 422 |
+| `roas`              | `object[]` | ROA 列表，可省略（默认 `[]`）；每条必须与 scope **同地址族** |
+| `roas[].cidr`       | `string`   | **严格 CIDR**（显式前缀长度、主机位为零）；跨地址族返回 422 |
+| `roas[].asn`        | `int`      | 该 ROA 授权的起源 ASN，0–4294967295；越界返回 422 |
+| `roas[].max_length` | `int`      | 该 ROA 允许的最大公告前缀长度；IPv4 不超过 32、IPv6 不超过 128，越界返回 422 |
+
+示例（低地址半区两条 `/26` 均被授权合并为一段 `valid /25`，错误 ASN 的
+ROA 使一条 `/26` 成为 `invalid`，最后一条 `/26` 无任何覆盖为 `unknown`）：
+
+```bash
+curl -s -X POST http://localhost:8000/roa-coverage \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "scope": "10.0.0.0/24",
+        "asn": 64512,
+        "prefix_length": 26,
+        "roas": [
+          {"cidr": "10.0.0.0/25", "asn": 64512, "max_length": 26},
+          {"cidr": "10.0.0.128/26", "asn": 64496, "max_length": 32}
+        ]
+      }'
+```
+
+响应（按网络地址排序的最小分区）：
+
+```json
+{
+  "partitions": [
+    {"cidr": "10.0.0.0/25", "status": "valid"},
+    {"cidr": "10.0.0.128/26", "status": "invalid"},
+    {"cidr": "10.0.0.192/26", "status": "unknown"}
+  ]
+}
+```
+
+IPv6 示例同样适用，分区可以远短于拟发布长度：
+
+```bash
+curl -s -X POST http://localhost:8000/roa-coverage \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "scope": "2001:db8::/46",
+        "asn": 64512,
+        "prefix_length": 48,
+        "roas": [
+          {"cidr": "2001:db8::/47", "asn": 64512, "max_length": 48},
+          {"cidr": "2001:db8:2::/48", "asn": 64496, "max_length": 48}
+        ]
+      }'
+# {
+#   "partitions": [
+#     {"cidr": "2001:db8::/47", "status": "valid"},
+#     {"cidr": "2001:db8:2::/48", "status": "invalid"},
+#     {"cidr": "2001:db8:3::/48", "status": "unknown"}
+#   ]
+# }
+```
+
+要点：
+
+- 无任何 ROA 时整个 scope 为一段 `unknown`（包括 `::/0` + `/128` 这种无法
+  枚举候选的输入）；与 scope 不相交、或比 `prefix_length` 更长的 ROA 不
+  影响结果；重复 ROA 按一条处理；
+- 一条 ROA 的 `cidr` 可以等于或宽于 scope（例如 scope `/24`、ROA `/16`），
+  此时它覆盖整个 scope；
+- `max_length` 恰为拟发布长度时可以授权，差一位都不行——例如 ROA
+  `10.0.0.0/24`、`max_length 24` 对拟发布 `/26` 的候选只构成覆盖而不授权，
+  结果为 `invalid`；
+- `scope` 非法/主机位非零、`asn` 越界（负数或大于 4294967295）、
+  `prefix_length` 短于 scope 前缀或超出地址族上限、ROA CIDR 非法或
+  **跨地址族**、ROA `asn` 非法、`max_length` 越界，统一返回 **HTTP 422**。
+
 ## 算法说明
 
 1. **解析校验**：`ipaddress.ip_network(value, strict=True)` 严格解析；
@@ -820,6 +931,24 @@ scope 的最大 CIDR 瓦片，每块直接携带**获胜条目本体**（无获�
 4. 输出的区与记录按来源网段的 `(network_address.packed, prefixlen)`
    排序，同一网段的 NS 先于 CNAME，每条输出都回带其输入 `cidr`。
 
+`/roa-coverage` 复用 `/compare` 同款前缀树分区思路
+（`app/policy.py` 中 `roa_coverage` / `_roa_partition_node` /
+`_merge_status_pieces`），只是把“获胜条目”换成两个布尔标记：
+
+1. 预处理：严格解析 scope 与每条 ROA（跨地址族由 schema 整批拒绝）；前缀
+   长度大于拟发布长度的 ROA 不可能包含候选路由，直接忽略；每条剩余 ROA
+   预计算 `authorizes = (ROA.asn == 目标 asn 且 max_length >= prefix_length)`；
+2. 自 scope 起递归：等于或包含 scope 的 ROA 在根节点给出两个继承标记
+   `covered`（是否有任何覆盖 ROA）与 `authorized`（是否有任何授权 ROA）；
+   严格位于节点内部的 ROA 把节点对半切开，落在本节点上的 ROA 更新两个
+   标记（任一为真即真），节点内没有更深 ROA 或已到达拟发布长度时整体
+   输出。标记映射为状态：`authorized → valid`，否则 `covered → invalid`，
+   否则 `unknown`。递归深度最多为 `prefix_length − scope.prefixlen`
+   （≤128），输出片数只与 ROA 边界数有关，**绝不枚举候选路由**；
+3. 与 `/compare` 相同的**带状态兄弟合并**（不动点循环）：同一父网的左右
+   两半都在且状态相同才合并，合并结果继续向上合并；不等长相邻段、状态
+   不同的兄弟不合并，得到**数量最少**的状态分区，最后按网络地址排序。
+
 ## 本地开发（不使用 Docker）
 
 需要 Python 3.11+：
@@ -844,12 +973,12 @@ pytest -q
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize、/evaluate、/compare、/audit-rules、/minimize-policy、/allocate、/anonymize、/reverse-delegations
-│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计、最长前缀匹配、获胜者分区、规则审计、分区对比、最少规则子集搜索、子网分配搜索、前缀保持 HMAC 脱敏、反向 DNS 委派计划（仅 ipaddress + hmac/hashlib）
+│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize、/evaluate、/compare、/audit-rules、/minimize-policy、/allocate、/anonymize、/reverse-delegations、/roa-coverage
+│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计、最长前缀匹配、获胜者分区、规则审计、分区对比、最少规则子集搜索、子网分配搜索、前缀保持 HMAC 脱敏、反向 DNS 委派计划、ROA 覆盖状态分区（仅 ipaddress + hmac/hashlib）
 │   └── schemas.py     # Pydantic 请求/响应模型与 422 校验
 ├── tests/
-│   ├── test_policy.py # 核心算法单测 + 随机对拍（含 /compare、/audit-rules 逐地址对拍、/minimize-policy 子集暴力枚举对拍、/allocate 暴力枚举对拍、/anonymize 双射/最长公共前缀保持性质与独立参考实现对拍、/reverse-delegations 名称拼装与整批校验）
-│   └── test_api.py    # API 层测试（422、409、统计、空请求等，含 /reverse-delegations 排序/CNAME 覆盖/422 路径）
+│   ├── test_policy.py # 核心算法单测 + 随机对拍（含 /compare、/audit-rules 逐地址对拍、/minimize-policy 子集暴力枚举对拍、/allocate 暴力枚举对拍、/anonymize 双射/最长公共前缀保持性质与独立参考实现对拍、/reverse-delegations 名称拼装与整批校验、/roa-coverage 逐候选路由对拍）
+│   └── test_api.py    # API 层测试（422、409、统计、空请求等，含 /reverse-delegations 排序/CNAME 覆盖/422 路径、/roa-coverage 状态与 422 路径）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

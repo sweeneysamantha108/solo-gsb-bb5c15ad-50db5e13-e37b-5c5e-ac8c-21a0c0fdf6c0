@@ -1,6 +1,6 @@
 """FastAPI application exposing POST /normalize, /evaluate, /compare,
-/audit-rules, /minimize-policy, /allocate, /anonymize and
-/reverse-delegations."""
+/audit-rules, /minimize-policy, /allocate, /anonymize,
+/reverse-delegations and /roa-coverage."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from app.policy import (
     minimize_policy,
     normalize,
     reverse_delegations,
+    roa_coverage,
 )
 from app.schemas import (
     AddressDecision,
@@ -33,6 +34,8 @@ from app.schemas import (
     PolicyRequest,
     ReverseDelegationsRequest,
     ReverseDelegationsResponse,
+    RoaCoverageRequest,
+    RoaCoverageResponse,
 )
 
 app = FastAPI(
@@ -48,11 +51,14 @@ app = FastAPI(
         "for a list of requests inside one scope, avoiding already-occupied "
         "CIDRs; prefix-preservingly anonymize bare IPv4/IPv6 addresses "
         "and strict CIDRs with an HMAC-SHA256 key for safe list sharing; "
-        "and plan reverse-DNS delegations for the IPv4 networks of one /24 "
+        "plan reverse-DNS delegations for the IPv4 networks of one /24 "
         "(direct in-addr.arpa NS for a /24, RFC 2317 range-label subzones "
-        "plus per-address CNAMEs for /25-/32)."
+        "plus per-address CNAMEs for /25-/32); and classify every candidate "
+        "route of one planned prefix length inside a scope as valid, "
+        "invalid or unknown against an RPKI ROA list, returned as a "
+        "minimal labelled CIDR partition."
     ),
-    version="1.7.0",
+    version="1.8.0",
 )
 
 
@@ -825,4 +831,133 @@ def anonymize_addresses(request: AnonymizeRequest) -> dict:
 def plan_reverse_delegations(request: ReverseDelegationsRequest) -> dict:
     return reverse_delegations(
         [(item.cidr, item.nameservers) for item in request.delegations]
+    )
+
+
+@app.post(
+    "/roa-coverage",
+    response_model=RoaCoverageResponse,
+    tags=["policy"],
+    summary="Classify candidate routes of one planned prefix length against ROAs",
+    openapi_extra={
+        # See /evaluate: named body examples survive only via openapi_extra
+        # for model-typed parameters.
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "mixed_statuses_ipv4": {
+                            "summary": (
+                                "Two valid /26s merge into a valid /25; a "
+                                "wrong-ASN ROA makes one /26 invalid; the "
+                                "last /26 has no covering ROA (unknown)"
+                            ),
+                            "value": {
+                                "scope": "10.0.0.0/24",
+                                "asn": 64512,
+                                "prefix_length": 26,
+                                "roas": [
+                                    {"cidr": "10.0.0.0/25", "asn": 64512,
+                                     "max_length": 26},
+                                    {"cidr": "10.0.0.128/26", "asn": 64496,
+                                     "max_length": 32},
+                                ],
+                            },
+                        },
+                        "covered_but_max_length_too_short": {
+                            "summary": (
+                                "The ROA prefix covers all /26 candidates "
+                                "but max_length 24 < 26, so the whole scope "
+                                "is invalid (max_length gates authorization, "
+                                "not coverage)"
+                            ),
+                            "value": {
+                                "scope": "192.0.2.0/24",
+                                "asn": 64496,
+                                "prefix_length": 26,
+                                "roas": [
+                                    {"cidr": "192.0.2.0/24", "asn": 64496,
+                                     "max_length": 24},
+                                ],
+                            },
+                        },
+                        "cross_family_roa_rejected": {
+                            "summary": "An IPv6 ROA with an IPv4 scope -> HTTP 422",
+                            "value": {
+                                "scope": "10.0.0.0/24",
+                                "asn": 64512,
+                                "prefix_length": 26,
+                                "roas": [
+                                    {"cidr": "2001:db8::/32", "asn": 64512,
+                                     "max_length": 48},
+                                ],
+                            },
+                        },
+                        "prefix_length_shorter_than_scope_rejected": {
+                            "summary": "No candidate of that length fits in scope -> HTTP 422",
+                            "value": {
+                                "scope": "10.0.0.0/24",
+                                "asn": 64512,
+                                "prefix_length": 16,
+                                "roas": [],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+    responses={
+        200: {
+            "description": (
+                "The minimal non-overlapping status partition of the scope, "
+                "sorted by network address."
+            ),
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "mixed_statuses_ipv4": {
+                            "summary": "valid /25, invalid /26, unknown /26",
+                            "value": {
+                                "partitions": [
+                                    {"cidr": "10.0.0.0/25", "status": "valid"},
+                                    {"cidr": "10.0.0.128/26",
+                                     "status": "invalid"},
+                                    {"cidr": "10.0.0.192/26",
+                                     "status": "unknown"},
+                                ],
+                            },
+                        },
+                        "covered_but_max_length_too_short": {
+                            "summary": "The whole scope is invalid",
+                            "value": {
+                                "partitions": [
+                                    {"cidr": "192.0.2.0/24",
+                                     "status": "invalid"},
+                                ],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        422: {
+            "description": (
+                "Invalid scope/ROA CIDR, host bits set, prefix_length "
+                "outside [scope prefixlen, family maximum], an illegal "
+                "ASN, a max_length outside the family range, or an ROA "
+                "whose address family does not match the scope."
+            ),
+        },
+    },
+)
+def classify_roa_coverage(request: RoaCoverageRequest) -> dict:
+    return roa_coverage(
+        request.scope,
+        request.asn,
+        request.prefix_length,
+        [
+            (entry.cidr, entry.asn, entry.max_length)
+            for entry in request.roas
+        ],
     )

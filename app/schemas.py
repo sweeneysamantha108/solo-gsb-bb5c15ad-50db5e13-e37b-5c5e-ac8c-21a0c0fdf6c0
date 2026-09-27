@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.policy import (
+    MAX_ASN,
     MINIMIZE_POLICY_RULE_LIMIT,
     _MAX_PREFIXLEN,
     _parse_nameserver,
@@ -624,5 +625,142 @@ class ReverseDelegationsResponse(BaseModel):
             "prefix length), keeping all records of one input CIDR grouped: "
             "its NS records first, then per-address CNAMEs ascending for "
             "RFC 2317 delegations."
+        ),
+    )
+
+
+class RoaEntry(BaseModel):
+    cidr: str = Field(
+        description=(
+            "Strict ROA CIDR (explicit prefix length, zero host bits); "
+            "must match the scope address family."
+        ),
+    )
+    asn: int = Field(
+        ge=0,
+        le=MAX_ASN,
+        description=(
+            "Origin ASN authorized by this ROA; a 32-bit unsigned integer "
+            "(0-4294967295)."
+        ),
+    )
+    max_length: int = Field(
+        ge=0,
+        description=(
+            "Maximum announced prefix length this ROA authorizes; must fit "
+            "the ROA address family (32 for IPv4, 128 for IPv6)."
+        ),
+    )
+
+    @field_validator("cidr")
+    @classmethod
+    def _validate_cidr(cls, value: str) -> str:
+        # Parsed again in the whole-request family check and in the endpoint;
+        # a ValueError here becomes an HTTP 422 pointing at this entry.
+        parse_strict_cidr(value)
+        return value
+
+    @model_validator(mode="after")
+    def _validate_max_length(self) -> "RoaEntry":
+        # The family-specific upper bound needs the parsed CIDR, so it is
+        # checked per entry rather than with the field-level bound.
+        network = parse_strict_cidr(self.cidr)
+        max_prefixlen = _MAX_PREFIXLEN[type(network)]
+        if self.max_length > max_prefixlen:
+            raise ValueError(
+                f"ROA max_length {self.max_length} exceeds /{max_prefixlen} "
+                f"for the address family of {network}"
+            )
+        return self
+
+
+class RoaCoverageRequest(BaseModel):
+    scope: str = Field(
+        description=(
+            "Single CIDR (IPv4 or IPv6) limiting the analysis region. "
+            "Strict: host bits must be zero."
+        ),
+    )
+    asn: int = Field(
+        ge=0,
+        le=MAX_ASN,
+        description=(
+            "Target origin ASN of the planned announcements; a 32-bit "
+            "unsigned integer (0-4294967295)."
+        ),
+    )
+    prefix_length: int = Field(
+        ge=0,
+        description=(
+            "Planned announcement prefix length. It must reach from the "
+            "scope prefix length to the family maximum (scope prefixlen <= "
+            "prefix_length <= 32 for IPv4, <= 128 for IPv6)."
+        ),
+    )
+    roas: list[RoaEntry] = Field(
+        default_factory=list,
+        description=(
+            "ROA list; every entry must share the scope address family. "
+            "Entries with a prefix longer than prefix_length cannot cover "
+            "any candidate route and are simply irrelevant."
+        ),
+    )
+
+    @field_validator("scope")
+    @classmethod
+    def _validate_scope(cls, value: str) -> str:
+        parse_network(value)
+        return value
+
+    @model_validator(mode="after")
+    def _validate_against_scope(self) -> "RoaCoverageRequest":
+        # Cross-entry and scope-dependent checks become an HTTP 422 just
+        # like the per-field validators.
+        scope = parse_network(self.scope)
+        max_prefixlen = _MAX_PREFIXLEN[type(scope)]
+        if self.prefix_length > max_prefixlen:
+            raise ValueError(
+                f"prefix_length {self.prefix_length} exceeds "
+                f"/{max_prefixlen} for the scope address family"
+            )
+        if self.prefix_length < scope.prefixlen:
+            raise ValueError(
+                f"prefix_length /{self.prefix_length} is shorter than the "
+                f"scope prefix /{scope.prefixlen}; no candidate route of "
+                f"that length lies inside the scope"
+            )
+        for entry in self.roas:
+            network = parse_strict_cidr(entry.cidr)
+            if not isinstance(network, type(scope)):
+                raise ValueError(
+                    f"ROA CIDR {network} does not match the scope "
+                    f"address family ({scope})"
+                )
+        return self
+
+
+class RoaCoveragePartition(BaseModel):
+    cidr: str = Field(
+        description=(
+            "Non-overlapping region of the scope with one constant status. "
+            "It may be shorter than the planned prefix length (all "
+            "candidate routes inside it share the status), never longer."
+        ),
+    )
+    status: Literal["valid", "invalid", "unknown"] = Field(
+        description=(
+            "'valid' when an authorizing ROA (same ASN, max_length reaching "
+            "the planned length) contains the candidate routes; 'invalid' "
+            "when some ROA contains them but none authorizes; 'unknown' "
+            "when no ROA contains them."
+        ),
+    )
+
+
+class RoaCoverageResponse(BaseModel):
+    partitions: list[RoaCoveragePartition] = Field(
+        description=(
+            "Minimal, non-overlapping status partition of the scope, sorted "
+            "by network address and jointly exhausting the scope."
         ),
     )

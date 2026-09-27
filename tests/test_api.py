@@ -1478,3 +1478,350 @@ def test_reverse_delegations_is_documented_in_openapi():
         "direct", "rfc2317"]
     record_schema = spec["components"]["schemas"]["ReverseRecord"]
     assert record_schema["properties"]["type"]["enum"] == ["NS", "CNAME"]
+
+
+# --------------------------------------------------------------------------
+# /roa-coverage
+# --------------------------------------------------------------------------
+
+
+def test_roa_coverage_mixed_statuses():
+    response = client.post(
+        "/roa-coverage",
+        json={
+            "scope": "10.0.0.0/24",
+            "asn": 64512,
+            "prefix_length": 26,
+            "roas": [
+                {"cidr": "10.0.0.0/25", "asn": 64512, "max_length": 26},
+                {"cidr": "10.0.0.128/26", "asn": 64496, "max_length": 32},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "partitions": [
+            {"cidr": "10.0.0.0/25", "status": "valid"},
+            {"cidr": "10.0.0.128/26", "status": "invalid"},
+            {"cidr": "10.0.0.192/26", "status": "unknown"},
+        ],
+    }
+
+
+def test_roa_coverage_no_roas_whole_scope_unknown():
+    response = client.post(
+        "/roa-coverage",
+        json={"scope": "2001:db8::/32", "asn": 64512, "prefix_length": 128},
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "partitions": [{"cidr": "2001:db8::/32", "status": "unknown"}],
+    }
+
+
+def test_roa_coverage_empty_roas_list_defaults_to_empty():
+    response = client.post(
+        "/roa-coverage",
+        json={
+            "scope": "10.0.0.0/24",
+            "asn": 0,
+            "prefix_length": 24,
+            "roas": [],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "partitions": [{"cidr": "10.0.0.0/24", "status": "unknown"}],
+    }
+
+
+def test_roa_coverage_ipv6():
+    response = client.post(
+        "/roa-coverage",
+        json={
+            "scope": "2001:db8::/46",
+            "asn": 64512,
+            "prefix_length": 48,
+            "roas": [
+                {"cidr": "2001:db8::/47", "asn": 64512, "max_length": 48},
+                {"cidr": "2001:db8:2::/48", "asn": 64496, "max_length": 48},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "partitions": [
+            {"cidr": "2001:db8::/47", "status": "valid"},
+            {"cidr": "2001:db8:2::/48", "status": "invalid"},
+            {"cidr": "2001:db8:3::/48", "status": "unknown"},
+        ],
+    }
+
+
+def test_roa_coverage_max_length_boundary():
+    # max_length exactly at the planned length authorizes; one less does not.
+    ok = client.post(
+        "/roa-coverage",
+        json={
+            "scope": "10.0.0.0/24",
+            "asn": 64512,
+            "prefix_length": 26,
+            "roas": [
+                {"cidr": "10.0.0.0/24", "asn": 64512, "max_length": 26},
+            ],
+        },
+    )
+    assert ok.json() == {
+        "partitions": [{"cidr": "10.0.0.0/24", "status": "valid"}],
+    }
+    short = client.post(
+        "/roa-coverage",
+        json={
+            "scope": "10.0.0.0/24",
+            "asn": 64512,
+            "prefix_length": 26,
+            "roas": [
+                {"cidr": "10.0.0.0/24", "asn": 64512, "max_length": 25},
+            ],
+        },
+    )
+    assert short.json() == {
+        "partitions": [{"cidr": "10.0.0.0/24", "status": "invalid"}],
+    }
+
+
+def test_roa_coverage_asn_extremes_accepted():
+    payload = {
+        "scope": "10.0.0.0/24",
+        "asn": 4294967295,
+        "prefix_length": 24,
+        "roas": [
+            {"cidr": "10.0.0.0/24", "asn": 4294967295, "max_length": 32},
+        ],
+    }
+    response = client.post("/roa-coverage", json=payload)
+    assert response.status_code == 200
+    assert response.json()["partitions"] == [
+        {"cidr": "10.0.0.0/24", "status": "valid"},
+    ]
+
+
+@pytest.mark.parametrize("asn", [-1, 4294967296, 2**40])
+def test_roa_coverage_illegal_target_asn_returns_422(asn):
+    response = client.post(
+        "/roa-coverage",
+        json={"scope": "10.0.0.0/24", "asn": asn, "prefix_length": 24},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "asn" for err in response.json()["detail"])
+
+
+@pytest.mark.parametrize("roa_asn", [-1, 4294967296])
+def test_roa_coverage_illegal_roa_asn_returns_422(roa_asn):
+    response = client.post(
+        "/roa-coverage",
+        json={
+            "scope": "10.0.0.0/24",
+            "asn": 64512,
+            "prefix_length": 24,
+            "roas": [
+                {"cidr": "10.0.0.0/24", "asn": roa_asn, "max_length": 24},
+            ],
+        },
+    )
+    assert response.status_code == 422
+    assert any(
+        err["loc"][-1] == "asn"
+        for err in response.json()["detail"]
+        if "roas" in err["loc"]
+    )
+
+
+@pytest.mark.parametrize("prefix_length", [-1, 33, 129])
+def test_roa_coverage_prefix_length_out_of_family_returns_422(prefix_length):
+    response = client.post(
+        "/roa-coverage",
+        json={
+            "scope": "10.0.0.0/24",
+            "asn": 64512,
+            "prefix_length": prefix_length,
+        },
+    )
+    assert response.status_code == 422
+    assert any(
+        err["loc"][-1] == "prefix_length" or err["loc"] == ["body"]
+        for err in response.json()["detail"]
+    )
+
+
+def test_roa_coverage_prefix_length_shorter_than_scope_returns_422():
+    response = client.post(
+        "/roa-coverage",
+        json={"scope": "10.0.0.0/24", "asn": 64512, "prefix_length": 16},
+    )
+    assert response.status_code == 422
+    assert "shorter than the scope prefix" in response.json()["detail"][0]["msg"]
+
+
+def test_roa_coverage_ipv6_prefix_length_out_of_family_returns_422():
+    response = client.post(
+        "/roa-coverage",
+        json={
+            "scope": "2001:db8::/32",
+            "asn": 64512,
+            "prefix_length": 129,
+        },
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("max_length", [-1, 33])
+def test_roa_coverage_bad_ipv4_max_length_returns_422(max_length):
+    response = client.post(
+        "/roa-coverage",
+        json={
+            "scope": "10.0.0.0/24",
+            "asn": 64512,
+            "prefix_length": 24,
+            "roas": [
+                {"cidr": "10.0.0.0/24", "asn": 64512, "max_length": max_length},
+            ],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_roa_coverage_ipv4_max_length_128_returns_422():
+    response = client.post(
+        "/roa-coverage",
+        json={
+            "scope": "10.0.0.0/24",
+            "asn": 64512,
+            "prefix_length": 24,
+            "roas": [
+                {"cidr": "10.0.0.0/24", "asn": 64512, "max_length": 128},
+            ],
+        },
+    )
+    assert response.status_code == 422
+    assert "max_length" in response.json()["detail"][0]["msg"]
+
+
+def test_roa_coverage_cross_family_roa_returns_422():
+    response = client.post(
+        "/roa-coverage",
+        json={
+            "scope": "10.0.0.0/24",
+            "asn": 64512,
+            "prefix_length": 26,
+            "roas": [
+                {"cidr": "2001:db8::/32", "asn": 64512, "max_length": 48},
+            ],
+        },
+    )
+    assert response.status_code == 422
+    assert "address family" in response.json()["detail"][0]["msg"]
+
+
+def test_roa_coverage_ipv4_roa_in_ipv6_scope_returns_422():
+    response = client.post(
+        "/roa-coverage",
+        json={
+            "scope": "2001:db8::/32",
+            "asn": 64512,
+            "prefix_length": 48,
+            "roas": [
+                {"cidr": "10.0.0.0/24", "asn": 64512, "max_length": 24},
+            ],
+        },
+    )
+    assert response.status_code == 422
+    assert "address family" in response.json()["detail"][0]["msg"]
+
+
+def test_roa_coverage_invalid_scope_returns_422():
+    response = client.post(
+        "/roa-coverage",
+        json={"scope": "not-a-cidr", "asn": 64512, "prefix_length": 24},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "scope" for err in response.json()["detail"])
+
+
+def test_roa_coverage_scope_host_bits_return_422():
+    response = client.post(
+        "/roa-coverage",
+        json={"scope": "10.0.0.1/24", "asn": 64512, "prefix_length": 24},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "scope" for err in response.json()["detail"])
+
+
+def test_roa_coverage_roa_host_bits_return_422():
+    response = client.post(
+        "/roa-coverage",
+        json={
+            "scope": "10.0.0.0/24",
+            "asn": 64512,
+            "prefix_length": 24,
+            "roas": [
+                {"cidr": "10.0.0.1/24", "asn": 64512, "max_length": 24},
+            ],
+        },
+    )
+    assert response.status_code == 422
+    assert any(
+        err["loc"][-1] == "cidr"
+        for err in response.json()["detail"]
+        if "roas" in err["loc"]
+    )
+
+
+def test_roa_coverage_roa_bare_address_returns_422():
+    response = client.post(
+        "/roa-coverage",
+        json={
+            "scope": "10.0.0.0/24",
+            "asn": 64512,
+            "prefix_length": 24,
+            "roas": [
+                {"cidr": "10.0.0.1", "asn": 64512, "max_length": 32},
+            ],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_roa_coverage_missing_required_fields_returns_422():
+    response = client.post("/roa-coverage", json={"scope": "10.0.0.0/24"})
+    assert response.status_code == 422
+    missing = {err["loc"][-1] for err in response.json()["detail"]}
+    assert "asn" in missing
+    assert "prefix_length" in missing
+
+
+def test_roa_coverage_wrong_types_return_422():
+    response = client.post(
+        "/roa-coverage",
+        json={"scope": 10, "asn": "64512", "prefix_length": "24"},
+    )
+    assert response.status_code == 422
+
+
+def test_roa_coverage_is_documented_in_openapi():
+    spec = client.get("/openapi.json").json()
+    assert "/roa-coverage" in spec["paths"]
+    operation = spec["paths"]["/roa-coverage"]["post"]
+    assert "422" in operation["responses"]
+    examples = operation["requestBody"]["content"]["application/json"][
+        "examples"
+    ]
+    assert "mixed_statuses_ipv4" in examples
+    assert "cross_family_roa_rejected" in examples
+    response_examples = operation["responses"]["200"]["content"][
+        "application/json"
+    ]["examples"]
+    assert "mixed_statuses_ipv4" in response_examples
+    partition_schema = spec["components"]["schemas"]["RoaCoveragePartition"]
+    assert partition_schema["properties"]["status"]["enum"] == [
+        "valid", "invalid", "unknown"]

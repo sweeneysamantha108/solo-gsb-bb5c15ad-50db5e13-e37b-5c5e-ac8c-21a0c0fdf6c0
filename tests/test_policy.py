@@ -26,6 +26,7 @@ from app.policy import (
     parse_network,
     parse_strict_cidr,
     reverse_delegations,
+    roa_coverage,
     TRANSITION_KEYS,
 )
 
@@ -1904,3 +1905,293 @@ def test_reverse_sibling_delegations_partition_the_parent_without_gaps():
     assert owners == list(range(256))
     assert all(r["cidr"] == "10.0.0.0/25" for r in cnames[:128])
     assert all(r["cidr"] == "10.0.0.128/25" for r in cnames[128:])
+
+
+# --------------------------------------------------------------------------
+# roa-coverage: valid / invalid / unknown status partition against ROAs
+# --------------------------------------------------------------------------
+
+
+def _roa_strings(result):
+    return [(p["cidr"], p["status"]) for p in result["partitions"]]
+
+
+def test_roa_valid_invalid_unknown_and_sibling_merge():
+    # /26 candidates inside a /24: the two authorized /26s merge to a valid
+    # /25 piece (shorter than the planned length), one wrong-ASN ROA marks a
+    # /26 invalid, the last /26 is uncovered.
+    result = roa_coverage("10.0.0.0/24", 64512, 26, [
+        ("10.0.0.0/25", 64512, 26),
+        ("10.0.0.128/26", 64496, 32),
+    ])
+    assert _roa_strings(result) == [
+        ("10.0.0.0/25", "valid"),
+        ("10.0.0.128/26", "invalid"),
+        ("10.0.0.192/26", "unknown"),
+    ]
+
+
+def test_roa_whole_scope_unknown_without_roas():
+    # No ROAs at all: one piece, the whole scope, unknown.
+    assert _roa_strings(roa_coverage("10.0.0.0/24", 64512, 24, [])) == [
+        ("10.0.0.0/24", "unknown"),
+    ]
+    # Same for a huge IPv6 scope: no enumeration, a single piece.
+    assert _roa_strings(roa_coverage("::/0", 64512, 128, [])) == [
+        ("::/0", "unknown"),
+    ]
+
+
+def test_roa_valid_requires_same_asn():
+    # The ROA covers the only candidate but authorizes a different ASN.
+    assert _roa_strings(roa_coverage("10.0.0.0/24", 64512, 24, [
+        ("10.0.0.0/24", 64496, 24),
+    ])) == [("10.0.0.0/24", "invalid")]
+
+
+def test_roa_max_length_gates_authorization_not_coverage():
+    # max_length reaches /26 exactly -> valid.
+    assert _roa_strings(roa_coverage("10.0.0.0/24", 64512, 26, [
+        ("10.0.0.0/24", 64512, 26),
+    ])) == [("10.0.0.0/24", "valid")]
+    # One bit short: the ROA prefix still contains every candidate (invalid),
+    # and a second authorizing ROA wins its own region back; the three
+    # invalid /26s merge where they form complete siblings.
+    result = roa_coverage("10.0.0.0/24", 64512, 26, [
+        ("10.0.0.0/24", 64512, 25),
+        ("10.0.0.0/26", 64512, 26),
+    ])
+    assert _roa_strings(result) == [
+        ("10.0.0.0/26", "valid"),
+        ("10.0.0.64/26", "invalid"),
+        ("10.0.0.128/25", "invalid"),
+    ]
+
+
+def test_roa_valid_any_matching_roa_beats_other_covering_roas():
+    # A wrong-ASN ROA and an authorizing ROA both contain the upper half;
+    # the two lower invalid /26s merge into one invalid /25 piece.
+    assert _roa_strings(roa_coverage("10.0.0.0/24", 64512, 26, [
+        ("10.0.0.0/24", 64496, 32),
+        ("10.0.0.128/25", 64512, 26),
+    ])) == [
+        ("10.0.0.0/25", "invalid"),
+        ("10.0.0.128/25", "valid"),
+    ]
+
+
+def test_roa_supernet_entry_outside_scope_covers_all():
+    # A broader ROA containing the scope covers every candidate route.
+    assert _roa_strings(roa_coverage("10.0.0.0/24", 64512, 26, [
+        ("10.0.0.0/16", 64512, 32),
+    ])) == [("10.0.0.0/24", "valid")]
+    # Broader wrong-ASN ROA makes everything invalid.
+    assert _roa_strings(roa_coverage("10.0.0.0/24", 64512, 26, [
+        ("10.0.0.0/16", 64496, 32),
+    ])) == [("10.0.0.0/24", "invalid")]
+
+
+def test_roa_prefix_longer_than_planned_length_is_irrelevant():
+    # The only ROA is more specific than a candidate can ever be; it cannot
+    # contain a /24 candidate, so the scope stays unknown.
+    assert _roa_strings(roa_coverage("10.0.0.0/24", 64512, 24, [
+        ("10.0.0.0/25", 64496, 32),
+    ])) == [("10.0.0.0/24", "unknown")]
+
+
+def test_roa_as0_is_a_legal_32bit_value():
+    # AS 0 ROAs never authorize a non-zero target, but they do cover.
+    assert _roa_strings(roa_coverage("10.0.0.0/24", 64512, 24, [
+        ("10.0.0.0/24", 0, 24),
+    ])) == [("10.0.0.0/24", "invalid")]
+    # Target ASN 0 with an AS0 ROA is a literal same-ASN match.
+    assert _roa_strings(roa_coverage("10.0.0.0/24", 0, 24, [
+        ("10.0.0.0/24", 0, 24),
+    ])) == [("10.0.0.0/24", "valid")]
+
+
+def test_roa_duplicate_and_redundant_entries():
+    # Duplicate authorizing ROAs change nothing; disjoint ROAs are ignored;
+    # the two unknown /26s merge into one unknown /25 piece.
+    result = roa_coverage("10.0.0.0/24", 64512, 26, [
+        ("10.0.0.0/25", 64512, 26),
+        ("10.0.0.0/25", 64512, 26),
+        ("10.1.0.0/16", 64512, 32),
+    ])
+    assert _roa_strings(result) == [
+        ("10.0.0.0/25", "valid"),
+        ("10.0.0.128/25", "unknown"),
+    ]
+
+
+def test_roa_ipv6_statuses():
+    # Four /48 candidates inside a /46.
+    result = roa_coverage("2001:db8::/46", 64512, 48, [
+        ("2001:db8::/47", 64512, 48),
+        ("2001:db8:2::/48", 64496, 48),
+    ])
+    assert _roa_strings(result) == [
+        ("2001:db8::/47", "valid"),
+        ("2001:db8:2::/48", "invalid"),
+        ("2001:db8:3::/48", "unknown"),
+    ]
+
+
+def test_roa_ipv6_large_scope_never_enumerates_candidates():
+    # ::/0 with a planned /128: one authorizing /32 (valid), one
+    # wrong-ASN /32 (invalid), all other IPv6 space unknown.  The answer is
+    # produced instantly with only ROA-boundary pieces.
+    result = roa_coverage("::/0", 64512, 128, [
+        ("2001:db8::/32", 64512, 128),
+        ("2001:db9::/32", 64496, 128),
+    ])
+    pieces = [(ipaddress.ip_network(p["cidr"]), p["status"])
+              for p in result["partitions"]]
+    statuses = {n: s for n, s in pieces}
+    assert statuses[ipaddress.ip_network("2001:db8::/32")] == "valid"
+    assert statuses[ipaddress.ip_network("2001:db9::/32")] == "invalid"
+    assert all(
+        s == "unknown"
+        for n, s in pieces
+        if n not in (ipaddress.ip_network("2001:db8::/32"),
+                     ipaddress.ip_network("2001:db9::/32"))
+    )
+    # The pieces jointly exhaust all of IPv6 without enumerating 2**128 items.
+    assert sum(n.num_addresses for n, _s in pieces) == 2 ** 128
+    assert len(pieces) < 128
+
+
+def test_roa_max_length_never_authorizes_below_its_value():
+    # /24 ROA with max_length 16, plan /25: covered everywhere, authorized
+    # nowhere (max_length smaller than the ROA prefix length is a legal no-op
+    # ROA here, as long as it fits the family).
+    assert _roa_strings(roa_coverage("10.0.0.0/24", 64512, 25, [
+        ("10.0.0.0/24", 64512, 16),
+    ])) == [
+        ("10.0.0.0/24", "invalid"),
+    ]
+
+
+def test_roa_scope_equals_planned_length():
+    assert _roa_strings(roa_coverage("10.0.0.0/24", 64512, 24, [
+        ("10.0.0.0/24", 64512, 24),
+    ])) == [("10.0.0.0/24", "valid")]
+
+
+def _roa_reference_status(candidate, asn, roas):
+    """Brute-force per-candidate status straight from the specification."""
+    covered = False
+    authorized = False
+    for network, roa_asn, max_length in roas:
+        if candidate.subnet_of(network):
+            covered = True
+            if roa_asn == asn and max_length >= candidate.prefixlen:
+                authorized = True
+    return "valid" if authorized else ("invalid" if covered else "unknown")
+
+
+def _assert_roa_partition(scope, asn, length, roas):
+    """Check exhaustiveness, sorting, minimality and per-candidate equality."""
+    result = roa_coverage(str(scope), asn, length,
+                          [(str(n), a, m) for n, a, m in roas])
+    pieces = [(ipaddress.ip_network(p["cidr"]), p["status"])
+              for p in result["partitions"]]
+
+    # Sorted by network address.
+    assert pieces == sorted(
+        pieces, key=lambda item: item[0].network_address.packed
+    )
+
+    # Every piece lies in the scope, is aligned and is not longer than L.
+    for network, _status in pieces:
+        assert network.subnet_of(scope)
+        assert network.prefixlen >= scope.prefixlen
+        assert network.prefixlen <= length
+
+    # Non-overlapping and jointly exhaustive: sum of sizes equals scope.
+    total = sum(network.num_addresses for network, _s in pieces)
+    assert total == scope.num_addresses
+
+    # Every /L candidate inside the scope gets the partition's status.
+    covered_so_far = 0
+    family_max = scope.max_prefixlen
+    candidate_size = 1 << (family_max - length)
+    for network, status in pieces:
+        # Pieces come from prefix splits, so each is a union of /L candidates.
+        assert network.prefixlen <= length
+        for offset in range(0, network.num_addresses, candidate_size):
+            candidate = type(network)(
+                (int(network.network_address) + offset, length)
+            )
+            assert _roa_reference_status(candidate, asn, roas) == status
+            covered_so_far += 1
+
+    # Minimality: no two same-status complete siblings survive.
+    by_key = {
+        (network.network_address.packed, network.prefixlen): status
+        for network, status in pieces
+    }
+    for network, status in pieces:
+        if network.prefixlen == 0:
+            continue
+        left, right = network.supernet().subnets()
+        left_key = (left.network_address.packed, left.prefixlen)
+        right_key = (right.network_address.packed, right.prefixlen)
+        if left_key in by_key and right_key in by_key:
+            assert not (
+                by_key[left_key] == by_key[right_key] == status
+            )
+
+    # Number of /L candidate routes covered matches the scope contents.
+    expected_count = 1 << (length - scope.prefixlen)
+    assert covered_so_far == expected_count
+
+
+@pytest.mark.parametrize("seed", range(64))
+def test_roa_coverage_matches_per_candidate_reference_ipv4(seed):
+    rng = random.Random(4000 + seed)
+    base = 0x0A000000  # 10.0.0.0
+    scope_len = rng.randint(16, 24)
+    scope = ipaddress.IPv4Network((base, scope_len), strict=False)
+    length = min(32, scope_len + rng.randint(0, 8))
+    asn = rng.randrange(0, 5)
+    roas = []
+    for _ in range(rng.randint(0, 10)):
+        shift = rng.randint(0, 20)
+        addr = base + (rng.getrandbits(shift) << (24 - shift) if shift else 0)
+        # Some ROAs are deliberately longer than L (must be ignored as
+        # never-covering); the rest can cover candidates.
+        prefixlen = (
+            rng.randint(length + 1, 32)
+            if rng.random() < 0.2
+            else rng.randint(8, length)
+        )
+        network = ipaddress.IPv4Network((addr, prefixlen), strict=False)
+        max_length = rng.randint(max(0, prefixlen - 2), 32)
+        roas.append((network, rng.randrange(0, 6), max_length))
+    _assert_roa_partition(scope, asn, length, roas)
+
+
+@pytest.mark.parametrize("seed", range(32))
+def test_roa_coverage_matches_per_candidate_reference_ipv6(seed):
+    rng = random.Random(5000 + seed)
+    base = int(ipaddress.IPv6Address("2001:db8::"))
+    scope_len = rng.randint(32, 48)
+    scope = ipaddress.IPv6Network((base, scope_len), strict=False)
+    length = min(128, scope_len + rng.randint(0, 4))
+    asn = rng.randrange(0, 5)
+    roas = []
+    for _ in range(rng.randint(0, 8)):
+        prefixlen = (
+            rng.randint(length + 1, length + 4)
+            if rng.random() < 0.2
+            else rng.randint(32, min(64, length))
+        )
+        host = rng.randrange(2 ** 96)
+        addr = (base | host) & (~((1 << (128 - prefixlen)) - 1))
+        network = ipaddress.IPv6Network((addr, prefixlen), strict=False)
+        max_length = rng.randint(max(0, prefixlen - 2),
+                                 min(128, prefixlen + 8))
+        roas.append((network, rng.randrange(0, 6), max_length))
+    _assert_roa_partition(scope, asn, length, roas)
+
